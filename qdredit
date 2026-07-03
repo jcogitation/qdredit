@@ -1,0 +1,1566 @@
+#!/usr/bin/env python3
+"""
+qdredit - Qdrant memory manager for SillyTavern
+
+===========================================================================SYNTAX & USAGE GUIDE
+===========================================================================
+Qdrant is designed to automatically store SillyTavern chat messages in chunked "points" which an embedding server processes into a vector array and payload, along with a timestamp field (in UNIX Epoch milliseconds format) and a UUID (universally unique identifier) such as 8be4df61-93ca-11d2-aa0d-00e098032b8c in a named memory "collection". Within SillyTavern, you have very little ability to modify the collection or memories stored in it. qdredit lets you do pretty much whatever you want to a memory collection. Note: integer IDs are not used by default by the Qdrant SillyTavern extension, but they literally do not affect memory retrieval or stop Qdrant from matching the vector array just like with automatically stored entries with UUIDs. If you want to manually add entries to your collection, integer IDs are simpler to work with and do not harm anything.
+
+SETUP INSTRUCTIONS:
+
+Set the four values just below these instructions for your specific uses. 
+
+COLLECTION: Qdrant's default is per character memory collections, so mem_character1, mem_character2, etc. You can set the collection name to edit here, or you can call qdredit -c [collection name] <other options> and it will override this default.
+
+EMBEDDING URL: You will need to set up an embedding server, either an online API or a local model. Put the url here. 
+
+TIMEZONE: Set your timezone here. Use the TZ Identifier that matches your timezone from here: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones Only used for converting UNIX Epoch to local time for printing by date, etc.
+
+QDRANT URL: This is the URL of Qdrant server you're pulling from, almost certainly running on your own PC. The default is standard. The server has to be running for qdredit to be able to read/modify the database.
+"""
+
+DEFAULT_COLLECTION = "planescape_campaign"
+DEFAULT_EMBEDDING_URL = "http://localhost:8080/v1/embeddings"
+TIMEZONE = "America/Chicago"
+QD_URL = "http://localhost:6333"
+
+"""
+BASIC COMMANDS:
+
+  qdredit -count                     Show total number of points (all                                         types) in the collection.
+
+  qdredit -list                      List integer ID ranges and UUID                                          points in order by timestamp. Will                                       correctly display gaps where points                                      have been deleted in integer ranges.
+    
+  qdredit -print <input>             Print formatted point(s) (ID,                                            timestamp, text) with pretty card
+                                     formatting.
+  
+  qdredit -delete <input>            Delete point(s) after confirmation.
+                                     Specify integer, or uuid<index>
+                                     Handles ranges for both. Use qdredit                                        -list to get the indices for UUID     points.
+
+  qdredit -consolidate               Checks for missing integer IDs or                                        ranges and consolidates all integer                                      IDs into one contiguous range                                            starting from 0. Useful if you                                           deleted some points from the middle                                      or added points with a custom integer                                    ID and want to get a single range                                        from 0...N-1. UUID points are                                            untouched. Requires confirmation.
+                                     
+  qdredit -stripdate <uuidX>         Remove leading [YYYY-MM-DD] line from                                    UUID point(s). Useful if you want to                                     get rid of the tag Qdrant prepends to                                    every text payload so your AI                                            GM/character doesn't get confused and                                    to save tokens.
+  
+  qdredit -add --text "..."          Add a new point (requires active                                         embedding server). By default uses                                       the earliest unused Integer ID, so if                                    you have 100 integer IDs, delete                                         point 0, and then add a point, it                                        will be added as point 0 by default.
+                                     -add --text accepts input from a file
+                                     or from quoted text or from stdin as a
+                                     backup. 
+  
+  qdredit -fileprint <input>         Save full point data (including                                          vectors) in a range you select to a                                      file called 'qdrantpoints' in your                                       current working directory. If you're                                     outside /home, you might be denied                                       permission. -fileprint all saves all                                     points regardless of ID type. 
+
+  qdredit -fileadd                   Upserts points from 'qdrantpoints'                                       file directly to the database, using                                     all fields as written in the file. If                                    they were UUID points before they                                        will be again. If they were integer                                      points before, it will over/write                                        whatever is present to add them back                                     where they were before. Doesn't                                          require an embedding server, because                                     vector field data should be in the                                       file. You must be in the directory                                       where the file is located.
+ 
+OPTIONS:
+
+  -c, --collection NAME              Use a different collection (default:                                     mem_character_name). Note that you                                       can disable per character memories                                       and tell Qdrant to use whatever you                                      want as the collection name. Single                                      collections are better for a Tabletop                                    Roleplaying game with one player, one                                    GM.
+    
+  --color                            Force color output even if not a TTY.
+  --no-color                         Disable color output.
+
+ADDITIONAL OPTIONS FOR -add:
+
+  --text "..."                       Required: the text content of the new                                    point.
+
+  --id auto|INTEGER|UUID             Point ID (default: next integer).
+
+  --timestamp auto|'mm-dd-yyyy HH:MM:SS[.sss]'   
+                                     Timestamp (default: local time).
+
+  --embedding-url URL                Embedding server endpoint (default:                                            http://127.0.0.1:8080/v1/embeddings).
+
+INPUT FORMATS FOR -print, -delete, -fileprint:
+
+  Single integer ID:        0
+  Integer range:            0-10000 (practical max: 10^12, hard: 2^63-1)
+  Date (local time):        05-15-2026 (All points with that day's  timestamp.)
+  UUID by index:            uuid0, uuid101, ... but only one at a time.
+  UUID range by index:      uuid0-uuid1000 (ordered by timestamp and 
+                            alphanumerically by UUID as a backup if timestamp
+                            matches. 
+
+EXAMPLES:
+
+  # Show total points
+  qdredit -count
+
+  # List all points (both integer and UUID)
+  qdredit -list
+
+  # Print a single integer point
+  qdredit -print 40
+  
+  # Print a range of integer points
+  qdredit -print 100-200
+
+  # Print all points from a specific date
+  qdredit -print 05-15-2026
+
+  # Print a UUID point by its index (index available from -list)
+  qdredit -print uuid0
+
+  # Print a UUID point by its actual UUID:
+  qdredit -print 6ea8ec4d-3141-4e12-89f1-5d5e02a7bf51
+
+  # Print a range of UUID points by index
+  qdredit -print uuid700-uuid1500
+
+  # Delete an integer point
+  qdredit -delete 123
+
+  # Delete a range of integer points
+  qdredit -delete 100-200
+
+  # Delete a UUID point by index
+  qdredit -delete uuid2
+
+  # Delete a range of UUID points
+  qdredit -delete uuid0-uuid4
+
+  # Strip leading date from a UUID point
+  qdredit -stripdate uuid0
+
+  # Strip leading date from a range of UUID points
+  qdredit -stripdate uuid0-uuid5
+
+  # Add a new point (auto‑generated ID and timestamp)
+  qdredit -add --text "The party reached the Gilded Quill."
+
+  # Add a point with a specific integer ID and custom timestamp
+  qdredit -add --id 4000 --timestamp "05-10-2026 20:15:00" --text "Battle         with the Hill Giants. Results: 14500 GP. One undentified magic ring."
+
+  # Add a point from file
+  qdredit -add --text point200.txt
+
+  # Add a point using stdin, by typing manually
+  qdredit -add --id 1038 --timestamp "12-12-2099 23:59:59.999"
+  You will be prompted to enter text manually. CTRL+D or CTRL+Z ends.  
+
+  # Add a point using stdin and piping:
+  cat point75.txt | qdredit -add --id 2000 --timestamp "01-01-2075 00:00:00"     --embedding-url http://embeddingserver:4567/api/embeddings
+
+  # Use a different collection (e.g., per‑character memory)
+  qdredit -c mem_Character -list
+
+  # Save full point data (including vectors) for IDs 0-100 to file
+  qdredit -fileprint 0-100
+
+  # Save all points (both integer and UUID) with vectors to file
+  qdredit -fileprint all
+
+  # Restore all points from the file (no embedding server needed)
+  qdredit -fileadd
+
+NOTES:
+
+  - Integer IDs are stored as numbers, UUIDs as strings.
+  - The -fileprint output file is named 'qdrantpoints' in the current               directory.
+  - Use --no-color if redirecting output to a file or pipe.
+  - The embedding server must be running for -add to work.
+"""
+
+import argparse
+import sys
+import re
+import requests
+import json
+import os
+import textwrap
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+_points_cache = {}  # {collection: points_list}
+_MAX_ID_CACHE = {}
+
+# ======================= COLOR DEFINITIONS =======================
+COLOR_RESET = "\033[0m"                         # Resets color
+COLOR_BRIGHT_WHITE = "\033[1;37m"               # keep for some labels
+COLOR_BOLD_WHITE = "\033[1;38;5;7m"             # bold white
+COLOR_BOLD_BRIGHT_BLUE = "\033[1;38;5;27m"      # collection name
+COLOR_BOLD_BRIGHT_LIME = "\033[1;38;5;118m"     # integer counts / ranges
+COLOR_BOLD_INDIGO_WHITE = "\033[1;38;5;147m"    # "UUID Points in" label
+COLOR_BOLD_HOT_MAGENTA = "\033[1;38;5;201m"     # UUID value
+COLOR_BOLD_MUSTARD = "\x1b[1;38;5;136m"         # bold date in integer points
+COLOR_MUSTARD = "\x1b[38;5;136m"                # time in integer points
+COLOR_ICY_BLUE = "\x1b[38;5;147m"               # url strings
+COLOR_BOLD_BRIGHT_YELLOW = "\x1b[1;38;5;226m"   # bold date in uuid points
+COLOR_BRIGHT_YELLOW = "\x1b[38;5;226m"          # time in uuid points
+COLOR_BOLD_LEMON = "\033[1;38;5;193m"           # "Timestamp:" label
+COLOR_BOLD_RED_ORANGE = "\033[1;38;5;202m"      # "Text:" label
+COLOR_PEACH = "\033[38;5;173m"                  # text body
+COLOR_NEW_GRAY = "\033[38;5;250m"               # outer double lines
+COLOR_DIMMER_GRAY = "\033[38;5;246m"            # inner single line dividers
+COLOR_BOLD_BRICK_RED = "\033[1;38;5;160m"       # error messages
+BG_BLACK = "\033[48;5;0m\033[48;2;0;0;0m"       # 256-color fallback, 24-bit truecolor pure black background
+
+# ======================= BOX DRAWING CHARACTERS =======================
+DBL_HORIZ = "═"
+DBL_VERT = "║"
+DBL_TOP_LEFT = "╔"
+DBL_TOP_RIGHT = "╗"
+DBL_BOTTOM_LEFT = "╚"
+DBL_BOTTOM_RIGHT = "╝"
+DBL_VERT_SRIGHT = "╟"
+DBL_VERT_SLEFT = "╢"
+DBL_TOP_TSINGLE = "╤"
+SGL_VERT = "│"
+SGL_TUP = "┴"
+SGL_HORIZ = "─"
+SPCE = " "
+
+# ============================ FUNCTIONS ==============================
+def should_use_color():
+    return sys.stdout.isatty()
+
+COLOR_ENABLED = True
+
+def colorize(text, color_code):
+    if COLOR_ENABLED:
+        return f"{color_code}{text}{COLOR_RESET}"
+    return text
+
+def qdrant_request(endpoint, method="GET", data=None):
+    url = f"{QD_URL}{endpoint}"
+    headers = {"Content-Type": "application/json"}
+    try:
+        if method == "GET":
+            resp = requests.get(url, headers=headers)
+        elif method == "POST":
+            resp = requests.post(url, headers=headers, json=data)
+        elif method == "PUT":
+            resp = requests.put(url, headers=headers, json=data)
+        elif method == "DELETE":
+            resp = requests.delete(url, headers=headers)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} {e}", file=sys.stderr)
+        sys.exit(1)
+
+def get_collection_info(collection):
+    return qdrant_request(f"/collections/{collection}")
+
+def get_collection_config(collection):
+        """Return (vector_size, distance) for the collection's default vector."""
+        info = get_collection_info(collection)
+        vectors_config = info.get("result", {}).get("config", {}).get("params", {}).get("vectors", {})
+        # If the collection uses a single vector config (dictionary with size and distance)
+        if isinstance(vectors_config, dict) and "size" in vectors_config and "distance" in vectors_config:
+            return vectors_config["size"], vectors_config["distance"]
+        # If there are named vectors (e.g., {"text": {"size": 384, "distance": "Cosine"}})
+        # take the first one (most common case)
+        if isinstance(vectors_config, dict):
+            for v in vectors_config.values():
+                if isinstance(v, dict) and "size" in v and "distance" in v:
+                    return v["size"], v["distance"]
+        raise ValueError("Could not determine vector config from collection info")
+
+def point_exists(collection, pid):
+    """Return True if the point exists, False otherwise (including 404)."""
+    if isinstance(pid, int) and pid < 0:
+        return False
+    url = f"{QD_URL}/collections/{collection}/points/{pid}"
+    try:
+        resp = requests.get(url, headers={"Content-Type": "application/json"})
+        if resp.status_code == 404:
+            return False
+        resp.raise_for_status()
+        data = resp.json()
+        return "result" in data and data["result"] is not None
+    except requests.exceptions.RequestException:
+        return False
+
+def get_max_integer_id(collection, max_possible=10**9):
+    """
+    Return the largest existing integer point ID, or -1 if none exist.
+    Optimized for the common case where integer IDs are consolidated 0..N-1.
+    """
+    total_count = get_collection_info(collection).get("result", {}).get("points_count", 0)
+    if total_count == 0:
+        return -1
+
+    uuid_pairs = get_sorted_uuid_pairs(collection)
+    uuid_count = len(uuid_pairs)
+    integer_count = total_count - uuid_count
+
+    if integer_count > 0:
+        candidate = integer_count - 1
+        if point_exists(collection, candidate):
+            return candidate
+
+    # Fall back to binary search
+    low = -1
+    probe = 0
+    while probe <= max_possible:
+        if point_exists(collection, probe):
+            low = probe
+            break
+        if probe == 0:
+            probe = 1
+        else:
+            probe *= 2
+    if low == -1:
+        return -1
+
+    high = low * 2
+    if high == 0:
+        high = 1
+    while high <= max_possible and point_exists(collection, high):
+        high *= 2
+        if high > max_possible:
+            high = max_possible
+            break
+
+    while low < high:
+        mid = (low + high + 1) // 2
+        if point_exists(collection, mid):
+            low = mid
+        else:
+            high = mid - 1
+
+    return low
+
+def fetch_point_text(collection, pid):
+    resp = qdrant_request(f"/collections/{collection}/points/{pid}")
+    if "result" in resp and resp["result"]:
+        return resp["result"]["payload"].get("text", "")
+    return ""
+
+def get_all_points(collection, force_refresh=False):
+    """
+    Retrieve all points using cursor-based pagination, with caching.
+    Set force_refresh=True to ignore cache (e.g., after modifications).
+    """
+    if not force_refresh and collection in _points_cache:
+        return _points_cache[collection]
+
+    points = []
+    limit = 100
+    offset = None
+
+    while True:
+        data = {"limit": limit}
+        if offset is not None:
+            data["offset"] = offset
+
+        resp = qdrant_request(
+            f"/collections/{collection}/points/scroll",
+            method="POST",
+            data=data
+        )
+        result = resp.get("result", {})
+        page_points = result.get("points", [])
+        points.extend(page_points)
+
+        offset = result.get("next_page_offset")
+        if not offset:
+            break
+
+    _points_cache[collection] = points
+    return points
+
+def get_all_points_with_vectors(collection):
+    """
+    Retrieve all points including their vector data.
+    Uses paginated scroll with 'with_vector': True.
+    Does NOT cache results to avoid memory bloat.
+    """
+    points = []
+    limit = 100
+    offset = None
+
+    while True:
+        data = {"limit": limit, "with_vector": True}
+        if offset is not None:
+            data["offset"] = offset
+
+        resp = qdrant_request(
+            f"/collections/{collection}/points/scroll",
+            method="POST",
+            data=data
+        )
+        result = resp.get("result", {})
+        page_points = result.get("points", [])
+        points.extend(page_points)
+
+        offset = result.get("next_page_offset")
+        if not offset:
+            break
+
+    return points
+    
+def compact_ranges(ids):
+    if not ids:
+        return "none"
+    ids = sorted(ids)
+    ranges = []
+    start = ids[0]
+    prev = ids[0]
+    for i in ids[1:]:
+        if i - prev > 1:
+            if start == prev:
+                ranges.append(str(start))
+            else:
+                ranges.append(f"{start}-{prev}")
+            start = i
+        prev = i
+    if start == prev:
+        ranges.append(str(start))
+    else:
+        ranges.append(f"{start}-{prev}")
+    return ",".join(ranges)
+
+def get_sorted_uuid_pairs(collection):
+    points = get_all_points(collection)
+    uuids = []
+    for p in points:
+        pid = p["id"]
+        if isinstance(pid, str) and re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', pid):
+            ts = p["payload"].get("timestamp", 0)
+            uuids.append((ts, pid))
+    uuids.sort(key=lambda x: (x[0], x[1])) # sort by time, then UUID for                                                   # determinism
+    return uuids
+
+def invalidate_points_cache(collection):
+    """Invalidate cached points for a collection after changes."""
+    _points_cache.pop(collection, None)
+    _MAX_ID_CACHE.pop(collection, None)
+
+def format_timestamp(ts_ms):
+    secs = round(ts_ms / 1000.0)
+    dt = datetime.fromtimestamp(secs, tz=timezone.utc).astimezone(ZoneInfo(TIMEZONE))
+    return dt.strftime("%x %I:%M:%S %p")
+
+def visible_len(s):
+    """Return visible length of string after stripping ANSI escape sequences."""
+    return len(re.sub(r'\033\[[0-9;]*m', '', s))
+
+def fileprint_points(collection, point_ids, output_file="qdrantpoints"):
+    converted_ids = []
+    for pid in point_ids:
+        if pid.isdigit():
+            converted_ids.append(int(pid))
+        else:
+            converted_ids.append(pid)
+
+    resp = qdrant_request(f"/collections/{collection}/points", method="POST", data={"ids": converted_ids})
+    points = resp.get("result", [])
+    if not points:
+        print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} No points found for the given IDs")
+        return False
+    with open(output_file, 'w') as f:
+        json.dump(points, f, indent=2)
+    print(f"Saved {len(points)} points to {output_file}")
+    return True
+
+def fileprint_by_range(collection, start, end, output_file="qdrantpoints"):
+    points = get_all_points(collection)
+    filtered = [p for p in points if isinstance(p["id"], int) and start <= p["id"] <= end]
+    if not filtered:
+        print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} No points found in range {start}-{end}")
+        return False
+    with open(output_file, 'w') as f:
+        json.dump(filtered, f, indent=2)
+    print(f"Saved {len(filtered)} points to {output_file}")
+    return True
+
+def fileprint_by_date(collection, date_str, output_file="qdrantpoints"):
+    try:
+        month, day, year = map(int, date_str.split('-'))
+    except:
+        print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} Invalid date format (use mm-dd-yyyy)")
+        return False
+    tz = ZoneInfo(TIMEZONE)
+    dt = datetime(year, month, day, 0, 0, 0, tzinfo=tz)
+    start_utc = int(dt.astimezone(timezone.utc).timestamp() * 1000)
+    end_utc = int((dt + timedelta(days=1)).astimezone(timezone.utc).timestamp() * 1000)
+    points = get_all_points(collection)
+    filtered = [p for p in points if p["payload"].get("timestamp", 0) and start_utc <= p["payload"]["timestamp"] < end_utc]
+    if not filtered:
+        print(f"No points found for {date_str}")
+        return False
+    with open(output_file, 'w') as f:
+        json.dump(filtered, f, indent=2)
+    print(f"Saved {len(filtered)} points to {output_file}")
+    return True
+
+def fileprint_by_uuid_index(collection, idx, output_file="qdrantpoints"):
+    uuid_pairs = get_sorted_uuid_pairs(collection)
+    if not uuid_pairs:
+        print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} No UUID points exist")
+        return False
+    if idx >= len(uuid_pairs):
+        print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} UUID index {idx} out of range (max {len(uuid_pairs)-1})")
+        return False
+    uuid = uuid_pairs[idx][1]
+    resp = qdrant_request(f"/collections/{collection}/points/{uuid}")
+    if "result" not in resp or not resp["result"]:
+        print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} Point {uuid} not found")
+        return False
+    with open(output_file, 'w') as f:
+        json.dump([resp["result"]], f, indent=2)
+    print(f"Saved 1 point to {output_file}")
+    return True
+
+def fileprint_by_uuid_range(collection, start_idx, end_idx, output_file="qdrantpoints"):
+    uuid_pairs = get_sorted_uuid_pairs(collection)
+    if not uuid_pairs:
+        print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} No UUID points exist")
+        return False
+    if start_idx >= len(uuid_pairs) or end_idx >= len(uuid_pairs):
+        print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} UUID index range {start_idx}-{end_idx} out of range (max {len(uuid_pairs)-1})")
+        return False
+    uuids = [uuid_pairs[i][1] for i in range(start_idx, end_idx+1)]
+    resp = qdrant_request(f"/collections/{collection}/points", method="POST", data={"ids": uuids})
+    points = resp.get("result", [])
+    if not points:
+        print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} No points found")
+        return False
+    with open(output_file, 'w') as f:
+        json.dump(points, f, indent=2)
+    print(f"Saved {len(points)} points to {output_file}")
+    return True
+
+def fileprint_all(collection, output_file="qdrantpoints"):
+    """
+    Fetch all points (integer and UUID) including vectors, clean them,
+    and write a JSON object with metadata and points to a single file.
+    """
+    points = get_all_points_with_vectors(collection)
+    if not points:
+        print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} No points found in collection")
+        return False
+
+    # Clean each point: keep only id, vector, payload
+    cleaned_points = []
+    for p in points:
+        pid = p["id"]
+        if isinstance(pid, str) and pid.isdigit():
+            pid = int(pid)
+        cleaned_points.append({
+            "id": pid,
+            "vector": p["vector"],
+            "payload": p["payload"]
+        })
+
+    # Get collection metadata
+    try:
+        vector_size, distance = get_collection_config(collection)
+    except Exception as e:
+        print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} Could not read collection config: {e}")
+        return False
+
+    # Build the full export object
+    export_data = {
+        "metadata": {
+            "vector_size": vector_size,
+            "distance": distance
+        },
+        "points": cleaned_points
+    }
+
+    with open(output_file, 'w') as f:
+        json.dump(export_data, f, indent=2)
+
+    print(f"Saved {len(cleaned_points)} points with metadata (size={vector_size}, distance={distance}) to {output_file}")
+    return True
+
+def ensure_collection_exists(collection, vector_size, distance="Cosine"):
+    """Create collection if it doesn't exist, using given vector size and distance."""
+    try:
+        get_collection_info(collection)
+        # Collection exists – nothing to do
+    except:
+        # Collection does not exist – create it
+        data = {"vectors": {"size": vector_size, "distance": distance}}
+        qdrant_request(f"/collections/{collection}", method="PUT", data=data)
+        print(f"{colorize('Created collection:', COLOR_BRIGHT_WHITE)} {collection}")
+
+def fileadd_from_file(collection, input_file="qdrantpoints"):
+    """
+    Read points and metadata from a JSON file (created by -fileprint all)
+    and upsert them into Qdrant. Creates the collection if missing.
+    """
+    if not os.path.exists(input_file):
+        print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} File {input_file} not found")
+        return False
+
+    try:
+        with open(input_file, 'r') as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} Failed to parse JSON: {e}")
+        return False
+
+    # Handle both old format (array of points) and new format (object with points)
+    if isinstance(data, list):
+        # Legacy file: just points array
+        points = data
+        # Try to read metadata from companion file if it exists (optional compatibility)
+        meta_file = input_file + ".meta.json"
+        if os.path.exists(meta_file):
+            try:
+                with open(meta_file, 'r') as mf:
+                    meta = json.load(mf)
+                vector_size = meta.get("vector_size")
+                distance = meta.get("distance", "Cosine")
+            except:
+                vector_size = None
+                distance = "Cosine"
+        else:
+            # No metadata: get vector size from first point, prompt for distance
+            if not points:
+                print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} Empty points file")
+                return False
+            first_vector = points[0].get("vector")
+            if not first_vector:
+                print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} First point has no 'vector' field")
+                return False
+            vector_size = len(first_vector)
+            print(f"{colorize('No metadata found. Detected vector size:', COLOR_BRIGHT_WHITE)} {vector_size}")
+            distance = input(f"Enter distance metric [Cosine/Euclid/Dot] (default: Cosine): ").strip()
+            if distance not in ["Cosine", "Euclid", "Dot"]:
+                distance = "Cosine"
+    else:
+        # New format: object with metadata and points
+        metadata = data.get("metadata", {})
+        vector_size = metadata.get("vector_size")
+        distance = metadata.get("distance", "Cosine")
+        points = data.get("points", [])
+        if not points:
+            print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} No points in file")
+            return False
+        if not vector_size:
+            # Fallback: detect from first point
+            first_vector = points[0].get("vector")
+            if not first_vector:
+                print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} First point has no 'vector' field")
+                return False
+            vector_size = len(first_vector)
+
+    # Sanitize points (already cleaned, but re‑sanitize to be safe)
+    cleaned_points = []
+    for point in points:
+        pid = point.get("id")
+        if pid is None:
+            continue
+        if isinstance(pid, str) and pid.isdigit():
+            pid = int(pid)
+        if "vector" not in point or "payload" not in point:
+            continue
+        cleaned_points.append({
+            "id": pid,
+            "vector": point["vector"],
+            "payload": point["payload"]
+        })
+
+    if not cleaned_points:
+        print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} No valid points to add")
+        return False
+
+    # Ensure collection exists (create if missing) – silent check
+    resp = requests.get(f"{QD_URL}/collections/{collection}", headers={"Content-Type": "application/json"})
+    if resp.status_code == 404:
+        data = {"vectors": {"size": vector_size, "distance": distance}}
+        qdrant_request(f"/collections/{collection}", method="PUT", data=data)
+        print(f"{colorize('Created collection:', COLOR_BRIGHT_WHITE)} {collection} (size={vector_size}, distance={distance})")
+    elif resp.status_code != 200:
+        print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} Failed to check collection: {resp.status_code}", file=sys.stderr)
+        return False
+
+    # Upload in batches
+    batch_size = 100
+    total = len(cleaned_points)
+    for i in range(0, total, batch_size):
+        batch = cleaned_points[i:i+batch_size]
+        data = {"points": batch}
+        qdrant_request(f"/collections/{collection}/points", method="PUT", data=data)
+        print(f"Uploaded batch {i//batch_size + 1}/{(total-1)//batch_size + 1}")
+
+    print(f"Successfully added {total} points to collection '{collection}'")
+    invalidate_points_cache(collection)
+    return True
+
+def print_point(point):
+    """Print a single integer ID point with new color scheme and pure black background."""
+    pid = point["id"]
+    if not isinstance(pid, int):
+        print_uuid_point(point)
+        return
+
+    payload = point["payload"]
+    ts_ms = payload.get("timestamp")
+    if ts_ms:
+        ts_str = format_timestamp(ts_ms)
+        parts = ts_str.split()
+        if len(parts) >= 2:
+            date_str = parts[0]
+            time_str = f"{parts[1]} {parts[2]}" if len(parts) >= 3 else ""
+        else:
+            date_str = ts_str
+            time_str = ""
+    else:
+        date_str = "No date"
+        time_str = ""
+
+    text_body = payload.get("text", "")
+    int_id = str(pid)
+    id_len = len(int_id)
+
+    top = (COLOR_NEW_GRAY + DBL_TOP_LEFT +
+           DBL_HORIZ * 10 + DBL_TOP_TSINGLE +
+           DBL_HORIZ * 67 + DBL_TOP_RIGHT)
+    sys.stdout.write(BG_BLACK + top + COLOR_RESET + "\n")
+    sys.stdout.flush()
+
+    left_part = (BG_BLACK + COLOR_NEW_GRAY + DBL_VERT + SPCE +
+                 COLOR_BRIGHT_WHITE + "ID:" + SPCE +
+                 COLOR_BOLD_BRIGHT_LIME + int_id +
+                 SPCE * (4 - id_len) + SPCE)
+    sys.stdout.write(left_part + BG_BLACK + COLOR_DIMMER_GRAY + SGL_VERT + SPCE)
+    middle_part = (COLOR_BOLD_MUSTARD + date_str + SPCE +
+                   "⌚" + SPCE + COLOR_RESET + BG_BLACK + COLOR_MUSTARD +
+                   time_str + SPCE)
+    sys.stdout.write(BG_BLACK + middle_part + COLOR_RESET)
+    total_visible = visible_len(left_part) + visible_len(middle_part)
+    pad_needed = 76 - total_visible
+    if pad_needed < 0:
+        pad_needed = 0
+    sys.stdout.write(BG_BLACK + SPCE * pad_needed + COLOR_RESET)
+    sys.stdout.write(BG_BLACK + COLOR_NEW_GRAY + DBL_VERT + "\n")
+
+    sep = (COLOR_NEW_GRAY + DBL_VERT_SRIGHT + COLOR_DIMMER_GRAY +
+           SGL_HORIZ * 10 + SGL_TUP + SGL_HORIZ * 67 +
+           COLOR_NEW_GRAY + DBL_VERT_SLEFT)
+    sys.stdout.write(BG_BLACK + sep + COLOR_RESET + "\n")
+    sys.stdout.flush()
+
+    sys.stdout.write(BG_BLACK + COLOR_NEW_GRAY + DBL_VERT + SPCE +
+                     COLOR_BOLD_RED_ORANGE + "Text:" + SPCE)
+    words = text_body.split()
+    line_printer = ""
+    temp_word = ""
+    text_width = 70
+    while True:
+        if not temp_word and words:
+            temp_word = words.pop(0)
+        if not temp_word:
+            break
+        if not line_printer:
+            new_len = len(temp_word)
+        else:
+            new_len = len(line_printer) + 1 + len(temp_word)
+        if new_len <= text_width:
+            line_printer = temp_word if not line_printer else line_printer + SPCE + temp_word
+            temp_word = ""
+        else:
+            break
+    if temp_word:
+        words.insert(0, temp_word)
+    sys.stdout.write(COLOR_RESET + BG_BLACK + COLOR_PEACH +
+                     line_printer.ljust(text_width) + SPCE +
+                     COLOR_NEW_GRAY + DBL_VERT + COLOR_RESET + "\n")
+
+    text_width = 76
+    while words:
+        line_printer = ""
+        temp_word = ""
+        while True:
+            if not temp_word and words:
+                temp_word = words.pop(0)
+            if not temp_word:
+                break
+            if not line_printer:
+                new_len = len(temp_word)
+            else:
+                new_len = len(line_printer) + 1 + len(temp_word)
+            if new_len <= text_width:
+                line_printer = temp_word if not line_printer else line_printer + " " + temp_word
+                temp_word = ""
+            else:
+                break
+        if temp_word:
+            words.insert(0, temp_word)
+        print(BG_BLACK + COLOR_NEW_GRAY + DBL_VERT + SPCE +
+              COLOR_PEACH + line_printer.ljust(text_width) + SPCE +
+              COLOR_NEW_GRAY + DBL_VERT + COLOR_RESET)
+
+    bottom = (COLOR_NEW_GRAY + DBL_BOTTOM_LEFT +
+              DBL_HORIZ * 78 + DBL_BOTTOM_RIGHT)
+    print(BG_BLACK + bottom + COLOR_RESET)
+
+def print_uuid_point(point):
+    """Print a single UUID point with new color scheme and pure black background."""
+    pid = point["id"]
+    payload = point["payload"]
+    ts = payload.get("timestamp")
+    ts_str = format_timestamp(ts) if ts else "No timestamp"
+    text = payload.get("text", "")
+
+    parts = ts_str.split()
+    if len(parts) >= 2:
+        date_str = parts[0]
+        time_str = f"{parts[1]} {parts[2]}" if len(parts) >= 3 else ""
+    else:
+        date_str = ts_str
+        time_str = ""
+
+    top = (COLOR_NEW_GRAY + DBL_TOP_LEFT +
+           DBL_HORIZ * 44 + DBL_TOP_TSINGLE +
+           DBL_HORIZ * 33 + DBL_TOP_RIGHT)
+    print(BG_BLACK + top + COLOR_RESET)
+
+    id_line = (COLOR_NEW_GRAY + DBL_VERT + SPCE +
+               COLOR_BOLD_INDIGO_WHITE + "ID:" + SPCE +
+               COLOR_BOLD_HOT_MAGENTA + str(pid) + SPCE * 3 +
+               COLOR_RESET + BG_BLACK + COLOR_DIMMER_GRAY + SGL_VERT +
+               SPCE * 3 + COLOR_BOLD_LEMON + "Time:" +
+               SPCE + COLOR_BOLD_MUSTARD + date_str + SPCE +
+               "⌚" + SPCE + COLOR_RESET + BG_BLACK +
+               COLOR_MUSTARD + time_str + SPCE)
+    pad_needed = 78 - visible_len(id_line)
+    if pad_needed < 0:
+        pad_needed = 0
+    print(BG_BLACK + id_line + SPCE * pad_needed +
+          BG_BLACK + COLOR_NEW_GRAY + DBL_VERT + COLOR_RESET)
+
+    sep = (COLOR_NEW_GRAY + DBL_VERT_SRIGHT +
+           COLOR_DIMMER_GRAY + SGL_HORIZ * 44 +
+           SGL_TUP + SGL_HORIZ * 33 + COLOR_NEW_GRAY +
+           DBL_VERT_SLEFT)
+    print(BG_BLACK + sep + COLOR_RESET)
+
+    sys.stdout.write(BG_BLACK + COLOR_NEW_GRAY + DBL_VERT + SPCE +
+                     COLOR_BOLD_RED_ORANGE + "Text:" + SPCE)
+    words = text.split()
+    line_printer = ""
+    temp_word = ""
+    text_width = 70
+    while True:
+        if not temp_word and words:
+            temp_word = words.pop(0)
+        if not temp_word:
+            break
+        if not line_printer:
+            new_len = len(temp_word)
+        else:
+            new_len = len(line_printer) + 1 + len(temp_word)
+        if new_len <= text_width:
+            line_printer = temp_word if not line_printer else line_printer + " " + temp_word
+            temp_word = ""
+        else:
+            break
+    if temp_word:
+        words.insert(0, temp_word)
+    print(COLOR_RESET + BG_BLACK + COLOR_PEACH +
+          line_printer.ljust(text_width) + SPCE + COLOR_RESET +
+          BG_BLACK + COLOR_NEW_GRAY + DBL_VERT + COLOR_RESET)
+
+    text_width = 76
+    while words:
+        line_printer = ""
+        temp_word = ""
+        while True:
+            if not temp_word and words:
+                temp_word = words.pop(0)
+            if not temp_word:
+                break
+            if not line_printer:
+                new_len = len(temp_word)
+            else:
+                new_len = len(line_printer) + 1 + len(temp_word)
+            if new_len <= text_width:
+                line_printer = temp_word if not line_printer else line_printer + " " + temp_word
+                temp_word = ""
+            else:
+                break
+        if temp_word:
+            words.insert(0, temp_word)
+        print(BG_BLACK + COLOR_NEW_GRAY + DBL_VERT + SPCE +
+              COLOR_PEACH + line_printer.ljust(text_width) + SPCE +
+              COLOR_NEW_GRAY + DBL_VERT + COLOR_RESET)
+
+    bottom = (COLOR_NEW_GRAY + DBL_BOTTOM_LEFT +
+              DBL_HORIZ * 78 + DBL_BOTTOM_RIGHT)
+    print(BG_BLACK + bottom + COLOR_RESET)
+
+def fetch_point_by_id(collection, pid):
+    resp = qdrant_request(f"/collections/{collection}/points/{pid}")
+    if "result" not in resp or not resp["result"]:
+        print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} Point {pid} not found")
+        return
+    point = resp["result"]
+    if isinstance(pid, int):
+        print_point(point)
+    else:
+        print_uuid_point(point)
+
+def consolidate_integer_points(collection):
+        """
+        Re‑index all integer points to a contiguous range 0..N-1.
+        Only deletes old IDs that are greater than or equal to N (outside the new range).
+        Asks for confirmation and verifies all new points exist before deleting.
+        """
+        points = get_all_points_with_vectors(collection)
+        integer_points = [p for p in points if isinstance(p["id"], int)]
+        if not integer_points:
+            print(f"{colorize('Info:', COLOR_BRIGHT_WHITE)} No integer points to consolidate.")
+            return False
+    
+        integer_points.sort(key=lambda p: p["id"])
+        old_ids = [p["id"] for p in integer_points]
+        min_id = min(old_ids)
+        max_id = max(old_ids)
+        n = len(integer_points)
+        expected_max = n - 1
+    
+        # Already contiguous and start at 0? Exit.
+        if min_id == 0 and max_id == expected_max and (max_id - min_id + 1) == n:
+            print(f"{colorize('Info:', COLOR_BRIGHT_WHITE)} Integer points are already contiguous from 0 to {expected_max}. No consolidation needed.")
+            return True
+    
+        # Create mapping from old ID to new ID
+        new_id_map = {old: new for new, old in enumerate(old_ids)}
+    
+        # Show ranges and warn
+        print(f"\n{colorize('Integer points found:', COLOR_BRIGHT_WHITE)} {COLOR_BOLD_BRIGHT_LIME}{n}{COLOR_RESET}")
+        print(f"{colorize('Current ID range:', COLOR_BRIGHT_WHITE)} {COLOR_BOLD_BRIGHT_LIME}{min_id} {COLOR_BRIGHT_WHITE}– {COLOR_BOLD_BRIGHT_LIME}{max_id}{COLOR_RESET}")
+        print(f"{colorize('New ID range after consolidation:', COLOR_BRIGHT_WHITE)} {COLOR_BOLD_BRIGHT_LIME}0 {COLOR_BRIGHT_WHITE}– {COLOR_BOLD_BRIGHT_LIME}{expected_max}{COLOR_RESET}")
+        print()
+        print(f"{colorize('WARNING:', COLOR_BOLD_BRICK_RED)} If this operation is interrupted or fails, you could lose all your data.")
+        print(f"{colorize('You can always say no and back up your whole collection with:', COLOR_BRIGHT_WHITE)}")
+        print(f"  {colorize('qdredit -fileprint all', COLOR_BOLD_BRIGHT_LIME)}")
+        confirm = input(f"{colorize('Proceed with consolidation? (y/n): ', COLOR_BRIGHT_WHITE)}").strip().lower()
+        if confirm != 'y':
+            print("Cancelled.")
+            return False
+    
+        # Build clean new points
+        new_points = []
+        for p in integer_points:
+            new_points.append({
+                "id": new_id_map[p["id"]],
+                "vector": p["vector"],
+                "payload": p["payload"]
+            })
+    
+        # Upsert new points (this overwrites overlapping old IDs)
+        batch_size = 100
+        total = len(new_points)
+        for i in range(0, total, batch_size):
+            batch = new_points[i:i+batch_size]
+            data = {"points": batch}
+            qdrant_request(f"/collections/{collection}/points", method="PUT", data=data)
+            print(f"Uploaded batch {i//batch_size + 1}/{(total-1)//batch_size + 1}")
+    
+        # Safety: verify that ALL new points exist
+        missing = [new_id for new_id in range(n) if not point_exists(collection, new_id)]
+        if missing:
+            print(f"{colorize('ERROR:', COLOR_BOLD_BRICK_RED)} New points missing: {missing[:10]}... Aborting delete phase.")
+            return False
+    
+        # Delete only old IDs that are >= n (outside the new contiguous range)
+        ids_to_delete = [old for old in old_ids if old >= n]
+        if ids_to_delete:
+            print(f"{colorize('Deleting old IDs outside new range:', COLOR_BRIGHT_WHITE)} {min(ids_to_delete)}–{max(ids_to_delete)} (count {len(ids_to_delete)})")
+            for i in range(0, len(ids_to_delete), batch_size):
+                batch = ids_to_delete[i:i+batch_size]
+                data = {"points": batch}
+                qdrant_request(f"/collections/{collection}/points/delete", method="POST", data=data)
+                print(f"Deleted batch {i//batch_size + 1}/{(len(ids_to_delete)-1)//batch_size + 1}")
+        else:
+            print(f"{colorize('Info:', COLOR_BRIGHT_WHITE)} No old IDs outside the new range – nothing to delete.")
+    
+        print(f"{colorize('Consolidation complete.', COLOR_BOLD_BRIGHT_LIME)} Integer points now contiguous 0..{n-1}.")
+        invalidate_points_cache(collection)
+        return True
+
+def print_by_date(collection, date_str):
+    try:
+        month, day, year = map(int, date_str.split('-'))
+    except:
+        print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} Invalid date format (use mm-dd-yyyy)", file=sys.stderr)
+        return
+    tz = ZoneInfo(TIMEZONE)
+    dt = datetime(year, month, day, 0, 0, 0, tzinfo=tz)
+    start_utc = int(dt.astimezone(timezone.utc).timestamp() * 1000)
+    end_utc = int((dt + timedelta(days=1)).astimezone(timezone.utc).timestamp() * 1000)
+    points = get_all_points(collection)
+    found = False
+    for p in points:
+        ts = p["payload"].get("timestamp")
+        if ts is not None and start_utc <= ts < end_utc:
+            if isinstance(p["id"], int):
+                print_point(p)
+            else:
+                print_uuid_point(p)
+            found = True
+    if not found:
+        print(f"No points found for {date_str}")
+
+def delete_point(collection, pid):
+        qdrant_request(f"/collections/{collection}/points/delete", method="POST", data={"points": [pid]})
+        invalidate_points_cache(collection)
+        sys.stdout.write(COLOR_BRIGHT_WHITE + "Deleted point: ")
+        if isinstance(pid, int):
+            print(f"{colorize(pid, COLOR_BOLD_BRIGHT_LIME)}")
+        else:
+            # Assume UUID string
+            print(f"{colorize(pid, COLOR_BOLD_HOT_MAGENTA)}")
+
+def delete_range(collection, start, end):
+    for i in range(start, end+1):
+        delete_point(collection, i)
+    invalidate_points_cache(collection)   # redundant but safe
+
+def count_points(collection):
+    info = get_collection_info(collection)
+    count = info.get("result", {}).get("points_count", 0)
+    print(f"{colorize('Total points in', COLOR_BRIGHT_WHITE)} " +
+          f"{colorize(collection, COLOR_BOLD_BRIGHT_BLUE)}{colorize(':', COLOR_BRIGHT_WHITE)} " +
+          f"{colorize(str(count), COLOR_BOLD_BRIGHT_LIME)}")
+
+def list_points(collection):
+    points = get_all_points(collection)
+    integer_ids = [p["id"] for p in points if isinstance(p["id"], int)]
+    if integer_ids:
+        print(f"\n{colorize('Integer ID Points in', COLOR_BRIGHT_WHITE)} " +
+              f"{colorize(collection, COLOR_BOLD_BRIGHT_BLUE)}{colorize(':', COLOR_BRIGHT_WHITE)}")
+        print(colorize(compact_ranges(integer_ids), COLOR_BOLD_BRIGHT_LIME) + "\n")
+    else:
+        print(f"\n{colorize('Integer ID Points in', COLOR_BRIGHT_WHITE)} " +
+              f"{colorize(collection, COLOR_BOLD_BRIGHT_BLUE)}{colorize(':', COLOR_BRIGHT_WHITE)}                      none" + "\n")
+    uuid_pairs = get_sorted_uuid_pairs(collection)
+    if uuid_pairs:
+        print(f"{colorize('UUID Points in', COLOR_BOLD_INDIGO_WHITE)} " +
+              f"{colorize(collection, COLOR_BOLD_BRIGHT_BLUE)}{colorize(':', COLOR_BRIGHT_WHITE)}")
+        out_lines = []
+        idx = 0
+        first = True
+        current_date = ""
+        for ts, uuid in uuid_pairs:
+            dt_str = format_timestamp(ts).split()[0]
+            if first:
+                out_lines.append(f"{colorize(dt_str, COLOR_BRIGHT_YELLOW)} {colorize(format_timestamp(ts).split()[1], COLOR_BRIGHT_YELLOW)} {colorize(format_timestamp(ts).split()[2], COLOR_BRIGHT_YELLOW)}")
+                out_lines.append(f"{colorize(str(idx), COLOR_BOLD_INDIGO_WHITE)}{colorize(':', COLOR_BOLD_INDIGO_WHITE)} " + f"{colorize(uuid, COLOR_BOLD_HOT_MAGENTA)}")
+                current_date = dt_str
+                first = False
+            else:
+                if dt_str != current_date:
+                    out_lines.append(colorize(dt_str, COLOR_BRIGHT_YELLOW))
+                    current_date = dt_str
+                out_lines.append(f"{colorize(str(idx), COLOR_BOLD_INDIGO_WHITE)}{colorize(':', COLOR_BOLD_INDIGO_WHITE)} " +
+                                 f"{colorize(uuid, COLOR_BOLD_HOT_MAGENTA)}")
+            idx += 1
+        sys.stdout.write("\n".join(out_lines) + "\n")
+    else:
+        print(f"{colorize('UUID Points in', COLOR_BRIGHT_WHITE)} " +
+              f"{colorize(collection, COLOR_BOLD_BRIGHT_BLUE)}{colorize(':', COLOR_BRIGHT_WHITE)} none")
+
+def fetch_range_by_scroll(collection, start, end):
+    """Print all integer points with IDs between start and end (inclusive)."""
+    # Remove the get_max_integer_id() check entirely
+    # Just fetch and filter - if no points exist in range, output will be empty    
+    points = get_all_points(collection)
+    filtered = [p for p in points if isinstance(p["id"], int) and start <= p["id"] <= end]
+    if not filtered:
+        print(f"{colorize('Warning:', COLOR_BOLD_MUSTARD)} No integer points found in range {start}-{end}")
+        return
+    filtered.sort(key=lambda p: p["id"])
+    for p in filtered:
+        print_point(p)
+
+def print_by_uuid_index(collection, idx):
+    uuid_pairs = get_sorted_uuid_pairs(collection)
+    if not uuid_pairs:
+        print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} No UUID points exist", file=sys.stderr)
+        sys.exit(1)
+    if idx >= len(uuid_pairs):
+        print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} UUID index {idx} out of range (max {len(uuid_pairs)-1})", file=sys.stderr)
+        sys.exit(1)
+    uuid = uuid_pairs[idx][1]
+    fetch_point_by_id(collection, uuid)
+
+def print_by_uuid_range(collection, start_idx, end_idx):
+    uuid_pairs = get_sorted_uuid_pairs(collection)
+    if not uuid_pairs:
+        print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} No UUID points exist", file=sys.stderr)
+        sys.exit(1)
+    if start_idx == end_idx:
+        print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} Invalid range: start and end indices must be different (use single uuid<index> for one point)", file=sys.stderr)
+        sys.exit(1)
+    if start_idx >= len(uuid_pairs) or end_idx >= len(uuid_pairs):
+        print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} UUID index range {start_idx}-{end_idx} out of range (max {len(uuid_pairs)-1})", file=sys.stderr)
+        sys.exit(1)
+    points = get_all_points(collection)
+    point_map = {p["id"]: p for p in points if isinstance(p["id"], str)}
+    for i in range(start_idx, end_idx+1):
+        uuid = uuid_pairs[i][1]
+        p = point_map.get(uuid)
+        if p and "payload" in p:
+            print_uuid_point(p)
+        else:
+            print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} UUID {uuid} not found or has no payload")
+
+def strip_date_from_text(text):
+    pattern = r'^\[\d{4}-\d{2}-\d{2}\]\n'
+    if re.match(pattern, text):
+        return re.sub(pattern, '', text)
+    return text
+
+def update_point_payload(collection, pid, new_payload):
+    resp = qdrant_request(f"/collections/{collection}/points/{pid}")
+    if "result" not in resp or not resp["result"]:
+        print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} Point {pid} not found")
+        return False
+    vector = resp["result"]["vector"]
+    data = {"points": [{"id": pid, "vector": vector, "payload": new_payload}]}
+    qdrant_request(f"/collections/{collection}/points", method="PUT", data=data)
+    invalidate_points_cache(collection)
+    return True
+
+def stripdate_by_uuid_index(collection, idx, dry_run=False):
+    uuid_pairs = get_sorted_uuid_pairs(collection)
+    if not uuid_pairs:
+        print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} No UUID points exist", file=sys.stderr)
+        sys.exit(1)
+    if idx >= len(uuid_pairs):
+        print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} UUID index {idx} out of range (max {len(uuid_pairs)-1})", file=sys.stderr)
+        sys.exit(1)
+    uuid = uuid_pairs[idx][1]
+    resp = qdrant_request(f"/collections/{collection}/points/{uuid}")
+    if "result" not in resp or not resp["result"]:
+        print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} Point {uuid} not found")
+        return
+    old_text = resp["result"]["payload"]["text"]
+    new_text = strip_date_from_text(old_text)
+    if old_text == new_text:
+        print(f"{colorize('UUID ', COLOR_BOLD_INDIGO_WHITE)}{colorize(uuid, COLOR_BOLD_HOT_MAGENTA)}{colorize(' already has no leading date (or pattern not matched). No change.', COLOR_BOLD_INDIGO_WHITE)}")
+        return
+    print('\n' + COLOR_BOLD_INDIGO_WHITE + "UUID: " + COLOR_BOLD_HOT_MAGENTA + uuid + COLOR_RESET)
+    print(f"{COLOR_BOLD_RED_ORANGE}Old text first 80 chars: {COLOR_PEACH}{old_text[:80]}...{COLOR_RESET}")
+    print(f"{COLOR_BOLD_RED_ORANGE}New text first 80 chars: {COLOR_PEACH}{new_text[:80]}...{COLOR_RESET}")
+    if dry_run:
+        print("Dry run – no changes made.")
+        return
+    confirm = input("Apply this change? (y/n) ").strip().lower()
+    if confirm == 'y':
+        new_payload = resp["result"]["payload"].copy()
+        new_payload["text"] = new_text
+        if update_point_payload(collection, uuid, new_payload):
+            print(f"{COLOR_BOLD_INDIGO_WHITE}Updated UUID {COLOR_BOLD_HOT_MAGENTA}{uuid}{COLOR_RESET}")
+        else:
+            print(f"{COLOR_BOLD_INDIGO_WHITE}Failed to update UUID {COLOR_BOLD_HOT_MAGENTA}{uuid}{COLOR_RESET}")
+    else:
+        print("Cancelled.")
+
+def stripdate_by_uuid_range(collection, start_idx, end_idx, dry_run=False):
+    uuid_pairs = get_sorted_uuid_pairs(collection)
+    if not uuid_pairs:
+        print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} No UUID points exist", file=sys.stderr)
+        sys.exit(1)
+    if start_idx == end_idx:
+        print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} Invalid range: start and end indices must be different (use single uuid<index> for one point)", file=sys.stderr)
+        return
+    if start_idx >= len(uuid_pairs) or end_idx >= len(uuid_pairs):
+        print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} UUID index range {start_idx}-{end_idx} out of range (max {len(uuid_pairs)-1})", file=sys.stderr)
+        return
+    count = end_idx - start_idx + 1
+    print(f"\n{COLOR_BOLD_INDIGO_WHITE}Will process {count} UUID points (indices {start_idx} to {end_idx}).{COLOR_RESET}")
+    if dry_run:
+        print("Dry run – no changes will be made.")
+    confirm = input("Proceed? (y/n) ").strip().lower()
+    if confirm != 'y':
+        print("Cancelled.")
+        return
+    for i in range(start_idx, end_idx+1):
+        uuid = uuid_pairs[i][1]
+        resp = qdrant_request(f"/collections/{collection}/points/{uuid}")
+        if "result" not in resp or not resp["result"]:
+            print(f"{COLOR_BOLD_BRICK_RED}Error: {COLOR_BOLD_INDIGO_WHITE}Point {COLOR_BOLD_HOT_MAGENTA}{uuid}{COLOR_BOLD_INDIGO_WHITE} not found, skipping{COLOR_RESET}")
+            continue
+        old_text = resp["result"]["payload"]["text"]
+        new_text = strip_date_from_text(old_text)
+        if old_text == new_text:
+            print(f"{COLOR_BOLD_INDIGO_WHITE}UUID {COLOR_BOLD_HOT_MAGENTA}{uuid}{COLOR_BOLD_INDIGO_WHITE} already has no leading date, skipping{COLOR_RESET}")
+            continue
+        new_payload = resp["result"]["payload"].copy()
+        new_payload["text"] = new_text
+        if update_point_payload(collection, uuid, new_payload):
+            print(f"{COLOR_BOLD_INDIGO_WHITE}Updated UUID {COLOR_BOLD_HOT_MAGENTA}{uuid}{COLOR_RESET}")
+        else:
+            print(f"{COLOR_BOLD_INDIGO_WHITE}Failed to update UUID {COLOR_BOLD_HOT_MAGENTA}{uuid}{COLOR_RESET}")
+    print("Done.")
+
+def delete_by_uuid_index(collection, idx):
+    uuid_pairs = get_sorted_uuid_pairs(collection)
+    if not uuid_pairs:
+        print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} No UUID points exist", file=sys.stderr)
+        sys.exit(1)
+    if idx >= len(uuid_pairs):
+        print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} UUID index {idx} out of range (max {len(uuid_pairs)-1})", file=sys.stderr)
+        sys.exit(1)
+    uuid = uuid_pairs[idx][1]
+    text = fetch_point_text(collection, uuid)
+    print(f"\n{COLOR_BOLD_INDIGO_WHITE}Delete UUID {COLOR_BOLD_HOT_MAGENTA}{uuid}{COLOR_BOLD_INDIGO_WHITE} ?{COLOR_RESET}")
+    wrapped_text = textwrap.fill(text, width=68, subsequent_indent=' '* 6)
+    print(f"{COLOR_BOLD_RED_ORANGE}Text: {COLOR_RESET}{COLOR_PEACH}{wrapped_text}\n{COLOR_RESET}")
+    confirm = input(COLOR_BRIGHT_WHITE + "Are you sure? (" + COLOR_BOLD_BRIGHT_LIME + "y" + COLOR_BRIGHT_WHITE + "/" + COLOR_BOLD_BRICK_RED + "n" + COLOR_BRIGHT_WHITE + ")" + COLOR_RESET).strip().lower()
+    if confirm == 'y':
+        delete_point(collection, uuid)
+    else:
+        print("Cancelled.")
+
+def delete_by_uuid_range(collection, start_idx, end_idx):
+    uuid_pairs = get_sorted_uuid_pairs(collection)
+    if not uuid_pairs:
+        print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} No UUID points exist", file=sys.stderr)
+        sys.exit(1)
+    if start_idx == end_idx:
+        print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} Invalid range: start and end indices must be different (use single uuid<index> for one point)", file=sys.stderr)
+        return
+    if start_idx >= len(uuid_pairs) or end_idx >= len(uuid_pairs):
+        print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} UUID index range {start_idx}-{end_idx} out of range (max {len(uuid_pairs)-1})", file=sys.stderr)
+        return
+    count = end_idx - start_idx + 1
+    first_uuid = uuid_pairs[start_idx][1]
+    last_uuid = uuid_pairs[end_idx][1]
+    first_text = fetch_point_text(collection, first_uuid)
+    last_text = fetch_point_text(collection, last_uuid)
+    print(f"\n{COLOR_BOLD_INDIGO_WHITE}Delete UUIDs {start_idx} - {end_idx} ({count} entries)")
+    print(f"{COLOR_BOLD_INDIGO_WHITE}{start_idx}: {COLOR_BOLD_HOT_MAGENTA}{first_uuid}{COLOR_RESET}")
+    wrapped_first = textwrap.fill(first_text, width=68, subsequent_indent=' ' * 6)
+    print(f"{COLOR_BOLD_RED_ORANGE}Text: {COLOR_RESET}{COLOR_PEACH}{wrapped_first}")
+    print(COLOR_BRIGHT_WHITE + "\n" + SPCE* 6 + "THROUGH\n" + COLOR_RESET)
+    print(f"{COLOR_BOLD_INDIGO_WHITE}{end_idx}: {COLOR_BOLD_HOT_MAGENTA}{last_uuid}{COLOR_RESET}")
+    wrapped_last = textwrap.fill(last_text, width=68, subsequent_indent=' ' * 6)
+    print(f"{COLOR_BOLD_RED_ORANGE}Text: {COLOR_RESET}{COLOR_PEACH}{wrapped_last}\n{COLOR_RESET}")
+    confirm = input(COLOR_BRIGHT_WHITE + "Are you sure? (" + COLOR_BOLD_BRIGHT_LIME + "y" + COLOR_BRIGHT_WHITE + "/" + COLOR_BOLD_BRICK_RED + "n" + COLOR_BRIGHT_WHITE + ") " + COLOR_RESET).strip().lower()
+    if confirm == 'y':
+        for i in range(start_idx, end_idx+1):
+            delete_point(collection, uuid_pairs[i][1])
+        print(f"{COLOR_BOLD_INDIGO_WHITE}Deleted {count} UUID points{COLOR_RESET}")
+    else:
+        print("Cancelled.")
+
+def get_embedding(text, url):
+    """Send text to embedding server and return vector.
+    Supports both OpenAI-compatible (data[0].embedding) and Harrier-style (embeddings[0]).
+    """
+    resp = requests.post(url, json={"input": [text]})
+    if resp.status_code != 200:
+        print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} Embedding server error: {resp.status_code} - {resp.text}", file=sys.stderr)
+        return None
+    data = resp.json()
+    # Try OpenAI format first (llama.cpp)
+    if "data" in data and len(data["data"]) > 0:
+        return data["data"][0].get("embedding")
+    # Fallback to older Harrier format
+    embeddings = data.get("embeddings", [])
+    if embeddings:
+        return embeddings[0]
+    print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} Unexpected embedding response format: {data}", file=sys.stderr)
+    return None
+
+def get_next_integer_id(collection):
+    points = get_all_points(collection)
+    int_ids = [p["id"] for p in points if isinstance(p["id"], int)]
+    if not int_ids:
+        return 0
+    return max(int_ids) + 1
+
+def datetime_to_millis(dt_str, tz_name):
+    try:
+        if '.' in dt_str:
+            dt = datetime.strptime(dt_str, "%m-%d-%Y %H:%M:%S.%f")
+        else:
+            dt = datetime.strptime(dt_str, "%m-%d-%Y %H:%M:%S")
+    except ValueError:
+        return None
+    tz = ZoneInfo(tz_name)
+    dt = dt.replace(tzinfo=tz)
+    return int(dt.timestamp() * 1000)
+
+def current_millis():
+    return int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+
+def add_point(collection, pid, vector, text, timestamp_ms):
+    payload = {"text": text, "source": "qdredit", "timestamp": timestamp_ms}
+    data = {"points": [{"id": pid, "vector": vector, "payload": payload}]}
+    qdrant_request(f"/collections/{collection}/points", method="PUT", data=data)
+    invalidate_points_cache(collection)
+    print(f"{COLOR_BRIGHT_WHITE}Added point with ID: {COLOR_BOLD_BRIGHT_LIME}{pid}{COLOR_RESET}")
+
+def main():
+    parser = argparse.ArgumentParser(description="Qdrant memory manager", add_help=False)
+    parser.add_argument("-c", "--collection", default=DEFAULT_COLLECTION, help="Collection name")
+    parser.add_argument("-count", action="store_true", help="Show total point count")
+    parser.add_argument("-list", action="store_true", help="List integer ID ranges and UUID points")
+    parser.add_argument("-print", nargs="?", const="", help="Print point(s): ID, range, date, uuid<index>, uuid<start>-uuid<end>")
+    parser.add_argument("-delete", nargs="?", const="", help="Delete point(s): ID, range, uuid<index>, uuid<start>-uuid<end>")
+    parser.add_argument("-stripdate", nargs="?", const="", help="Strip leading [YYYY-MM-DD]\\n from UUID point(s): uuid<index> or uuid<start>-uuid<end>")
+    parser.add_argument("-add", action="store_true", help="Add a new point")
+    parser.add_argument("--text", help="Text to add (required with -add)")
+    parser.add_argument("--id", default="auto", help="ID for new point: auto, integer, UUID")
+    parser.add_argument("--timestamp", default="auto", help="Timestamp: auto or 'mm-dd-yyyy HH:MM:SS.sss'")
+    parser.add_argument("--embedding-url", default=DEFAULT_EMBEDDING_URL, help="Embedding server URL")
+    parser.add_argument("--color", action="store_true", help="Force color output")
+    parser.add_argument("--no-color", action="store_true", help="Disable color output")
+    parser.add_argument("-consolidate", action="store_true", help="Re‑index all integer points to a contiguous range 0..N-1 (UUIDs unchanged).")
+    parser.add_argument("-fileprint", nargs="?", const="", help="Save full point data (including vector) to file 'qdrantpoints'. Accepts same inputs as -print.")
+    parser.add_argument("-fileadd", action="store_true", help="Add points from 'qdrantpoints' file back to Qdrant (without using embedding server).")
+    args = parser.parse_args()
+
+    global COLOR_ENABLED
+    if args.color:
+        COLOR_ENABLED = True
+    elif args.no_color:
+        COLOR_ENABLED = False
+    else:
+        COLOR_ENABLED = should_use_color()
+
+    collection = args.collection
+    if args.count:
+        count_points(collection)
+    elif args.list:
+        list_points(collection)
+    elif args.print is not None:
+        input_str = args.print
+        if not input_str:
+            print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} Missing input for -print", file=sys.stderr)
+            sys.exit(1)
+        if re.match(r'^\d{2}-\d{2}-\d{4}$', input_str):
+            print_by_date(collection, input_str)
+        elif re.match(r'^uuid(\d+)$', input_str):
+            idx = int(re.match(r'^uuid(\d+)$', input_str).group(1))
+            print_by_uuid_index(collection, idx)
+        elif re.match(r'^uuid(\d+)-uuid(\d+)$', input_str):
+            m = re.match(r'^uuid(\d+)-uuid(\d+)$', input_str)
+            start_idx, end_idx = int(m.group(1)), int(m.group(2))
+            print_by_uuid_range(collection, start_idx, end_idx)
+        elif re.match(r'^\d+$', input_str):
+            pid = int(input_str)
+            if pid < 0:
+                print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} Integer ID cannot be negative", file=sys.stderr)
+                sys.exit(1)
+            if not point_exists(collection, pid):
+                print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} Integer ID {pid} does not exist", file=sys.stderr)
+                sys.exit(1)
+            fetch_point_by_id(collection, pid)
+        elif re.match(r'^\d+-\d+$', input_str):
+            parts = input_str.split('-')
+            start, end = int(parts[0]), int(parts[1])
+            if start > end:
+                print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} start ID must be less than or equal to end ID", file=sys.stderr)
+                sys.exit(1)
+            if start < 0 or end < 0:
+                print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} Integer IDs cannot be negative", file=sys.stderr)
+                sys.exit(1)
+            fetch_range_by_scroll(collection, start, end)
+        elif re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', input_str):
+            if not point_exists(collection, input_str):
+                print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} UUID {input_str} does not exist", file=sys.stderr)
+                sys.exit(1)
+            fetch_point_by_id(collection, input_str)
+        else:
+            print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} Invalid input for -print", file=sys.stderr)
+            sys.exit(1)
+
+    elif args.fileprint is not None:
+        input_str = args.fileprint
+        output_file = "qdrantpoints"
+        if not input_str:
+            print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} Missing input for -fileprint")
+            sys.exit(1)
+
+        # Handle "all" separately and then exit    
+        if input_str == "all":
+            fileprint_all(collection, output_file)  
+            sys.exit(0)   # exit after successful export
+
+        # Handle "all" separately and then exit      
+        if re.match(r'^\d{2}-\d{2}-\d{4}$', input_str):
+            fileprint_by_date(collection, input_str, output_file)
+        elif re.match(r'^uuid(\d+)$', input_str):
+            idx = int(re.match(r'^uuid(\d+)$', input_str).group(1))
+            fileprint_by_uuid_index(collection, idx, output_file)
+        elif re.match(r'^uuid(\d+)-uuid(\d+)$', input_str):
+            m = re.match(r'^uuid(\d+)-uuid(\d+)$', input_str)
+            start_idx, end_idx = int(m.group(1)), int(m.group(2))
+            fileprint_by_uuid_range(collection, start_idx, end_idx, output_file)
+        elif re.match(r'^\d+$', input_str):
+            pid = int(input_str)
+            if not point_exists(collection, pid):
+                print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} Integer ID {pid} does not exist")
+                sys.exit(1)
+            fileprint_points(collection, [str(pid)], output_file)
+        elif re.match(r'^\d+-\d+$', input_str):
+            parts = input_str.split('-')
+            start, end = int(parts[0]), int(parts[1])
+            if start > end:
+                print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} start ID must be less than or equal to end ID")
+                sys.exit(1)
+            ids = [str(i) for i in range(start, end+1)]
+            fileprint_points(collection, ids, output_file)
+        elif re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', input_str):
+            fileprint_points(collection, [input_str], output_file)
+        else:
+            print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} Invalid input for -fileprint")
+            sys.exit(1)
+
+    elif args.fileadd:
+        fileadd_from_file(collection, "qdrantpoints")
+    elif args.consolidate:
+        consolidate_integer_points(collection)
+    elif args.delete is not None:
+        input_str = args.delete
+        if not input_str:
+            print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} Missing input for -delete", file=sys.stderr)
+            sys.exit(1)
+        if re.match(r'^uuid(\d+)$', input_str):
+            idx = int(re.match(r'^uuid(\d+)$', input_str).group(1))
+            delete_by_uuid_index(collection, idx)
+        elif re.match(r'^uuid(\d+)-uuid(\d+)$', input_str):
+            m = re.match(r'^uuid(\d+)-uuid(\d+)$', input_str)
+            start_idx, end_idx = int(m.group(1)), int(m.group(2))
+            delete_by_uuid_range(collection, start_idx, end_idx)
+        elif re.match(r'^\d+-\d+$', input_str):
+            parts = input_str.split('-')
+            start, end = int(parts[0]), int(parts[1])
+            if start == end:
+                print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} Invalid range: start and end IDs must be different (use single ID for one point)", file=sys.stderr)
+                sys.exit(1)
+            if start > end:
+                print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} start ID must be less than end ID", file=sys.stderr)
+                sys.exit(1)
+            if start < 0 or end < 0:
+                print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} Integer IDs cannot be negative", file=sys.stderr)
+                sys.exit(1)
+            if not point_exists(collection, start):
+                print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} Integer ID {start} does not exist", file=sys.stderr)
+                sys.exit(1)
+            if not point_exists(collection, end):
+                print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} Integer ID {end} does not exist", file=sys.stderr)
+                sys.exit(1)
+            count = end - start + 1
+            first_text = fetch_point_text(collection, start)
+            last_text = fetch_point_text(collection, end)
+            print(f"\n{COLOR_BRIGHT_WHITE}Delete integer IDs {COLOR_BOLD_BRIGHT_LIME}{start} {COLOR_BRIGHT_WHITE}-{COLOR_BOLD_BRIGHT_LIME} {end} ({count} {COLOR_BRIGHT_WHITE}entries){COLOR_RESET}")
+            wrapped_first = textwrap.fill(first_text, width=68, subsequent_indent=' ' * 6)
+            print(f"{COLOR_BOLD_BRIGHT_LIME}{start}{COLOR_BRIGHT_WHITE}, {COLOR_BOLD_RED_ORANGE}Text: {COLOR_RESET}{COLOR_PEACH}{wrapped_first}{COLOR_RESET}")
+            print("\n" + COLOR_BRIGHT_WHITE + SPCE* 6 + "THROUGH\n")
+            wrapped_last = textwrap.fill(last_text, width=68, subsequent_indent=' ' * 6)
+            print(f"{COLOR_BOLD_BRIGHT_LIME}{end}{COLOR_BRIGHT_WHITE}, {COLOR_BOLD_RED_ORANGE}Text: {COLOR_RESET}{COLOR_PEACH}{wrapped_last}{COLOR_RESET}\n")
+            confirm = input(COLOR_BRIGHT_WHITE + "Are you sure? (" + COLOR_BOLD_BRIGHT_LIME + "y" + COLOR_BRIGHT_WHITE + "/" + COLOR_BOLD_BRICK_RED + "n" + COLOR_BRIGHT_WHITE + ")" + COLOR_RESET).strip().lower()
+            if confirm == 'y':
+                delete_range(collection, start, end)
+                print(f"{COLOR_BRIGHT_WHITE}Deleted IDs {COLOR_BOLD_BRIGHT_LIME}{start}{COLOR_BRIGHT_WHITE}-{COLOR_BOLD_BRIGHT_LIME}{end}{COLOR_RESET}")
+            else:
+                print("Cancelled.")
+        elif re.match(r'^\d+$', input_str):
+            pid = int(input_str)
+            if pid < 0:
+                print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} Integer ID cannot be negative", file=sys.stderr)
+                sys.exit(1)
+            if not point_exists(collection, pid):
+                print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} Integer ID {pid} does not exist", file=sys.stderr)
+                sys.exit(1)
+            text = fetch_point_text(collection, pid)
+            print(f"\n{COLOR_BRIGHT_WHITE}Delete integer ID {COLOR_BOLD_BRIGHT_LIME}{pid}{COLOR_BRIGHT_WHITE} ?{COLOR_RESET}")
+            wrapped_text = textwrap.fill(text, width=68, subsequent_indent=' ' * 6)
+            print(f"{COLOR_BOLD_RED_ORANGE}Text: {COLOR_RESET}{COLOR_PEACH}{wrapped_text}\n{COLOR_RESET}")
+            confirm = input(COLOR_BRIGHT_WHITE + "Are you sure? (" + COLOR_BOLD_BRIGHT_LIME + "y" + COLOR_BRIGHT_WHITE + "/" + COLOR_BOLD_BRICK_RED + "n" + COLOR_BRIGHT_WHITE + ")" + COLOR_RESET).strip().lower()
+            if confirm == 'y':
+                delete_point(collection, pid)
+            else:
+                print("Cancelled.")
+        elif re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', input_str):
+            if not point_exists(collection, input_str):
+                print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} UUID {input_str} does not exist", file=sys.stderr)
+                sys.exit(1)
+            text = fetch_point_text(collection, input_str)
+            print(f"\n{COLOR_BOLD_INDIGO_WHITE}Delete UUID {COLOR_BOLD_HOT_MAGENTA}{input_str} {COLOR_BOLD_INDIGO_WHITE}?{COLOR_RESET}")
+            print(f"{COLOR_BOLD_RED_ORANGE}Text: {COLOR_RESET}{COLOR_PEACH}{text}\n")
+            confirm = input(COLOR_BRIGHT_WHITE + "Are you sure? (" + COLOR_BOLD_BRIGHT_LIME + "y" + COLOR_BRIGHT_WHITE + "/" + COLOR_BOLD_BRICK_RED + "n" + COLOR_RESET).strip().lower()
+            if confirm == 'y':
+                delete_point(collection, input_str)
+            else:
+                print("Cancelled.")
+        else:
+            print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} Invalid delete input", file=sys.stderr)
+            sys.exit(1)
+    elif args.stripdate is not None:
+        input_str = args.stripdate
+        if not input_str:
+            print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} Missing input for -stripdate", file=sys.stderr)
+            sys.exit(1)
+        if re.match(r'^uuid(\d+)$', input_str):
+            idx = int(re.match(r'^uuid(\d+)$', input_str).group(1))
+            stripdate_by_uuid_index(collection, idx, dry_run=False)
+        elif re.match(r'^uuid(\d+)-uuid(\d+)$', input_str):
+            m = re.match(r'^uuid(\d+)-uuid(\d+)$', input_str)
+            start_idx, end_idx = int(m.group(1)), int(m.group(2))
+            stripdate_by_uuid_range(collection, start_idx, end_idx, dry_run=False)
+        else:
+            print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} Invalid input for -stripdate. Use uuid<index> or uuid<start>-uuid<end>", file=sys.stderr)
+            sys.exit(1)
+    elif args.add:
+        # Determine text content: from --text if provided, else from stdin
+        if args.text:
+            # Check if the argument is a path to an existing file
+            if os.path.exists(args.text) and os.path.isfile(args.text):
+                try:
+                    with open(args.text, 'r') as f:
+                        text_content = f.read()
+                    print(f"{colorize('Reading text from file:', COLOR_BRIGHT_WHITE)} {args.text}", file=sys.stderr)
+                except Exception as e:
+                    print(f"{colorize('Error reading file:', COLOR_BOLD_BRICK_RED)} {e}", file=sys.stderr)
+                    sys.exit(1)
+            else:
+                # Not a file, use as literal text
+                text_content = args.text
+        else:
+            # No --text: read from stdin
+            if sys.stdin.isatty():
+                print(f"{colorize('Enter text (Ctrl+D or Ctrl+Z to finish):', COLOR_BRIGHT_WHITE)}", file=sys.stderr)
+            try:
+                lines = sys.stdin.read()
+            except KeyboardInterrupt:
+                print("\nCancelled.")
+                sys.exit(1)
+            if not lines:
+                print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} No input provided", file=sys.stderr)
+                sys.exit(1)
+            text_content = lines.rstrip('\n')
+
+        print(f"{colorize('Generating embedding from', COLOR_BRIGHT_WHITE)} {COLOR_ICY_BLUE}{args.embedding_url}{COLOR_RESET} ...", file=sys.stderr)
+        vector = get_embedding(text_content, args.embedding_url)
+        if vector is None:
+            print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} Failed to get embedding", file=sys.stderr)
+            sys.exit(1)
+
+        # ID handling (with integer conversion)
+        if args.id == "auto":
+            pid = get_next_integer_id(collection)
+        else:
+            if isinstance(args.id, str) and args.id.isdigit():
+                pid = int(args.id)
+            else:
+                pid = args.id
+
+        # Timestamp handling
+        if args.timestamp == "auto":
+            ts = current_millis()
+        else:
+            ts = datetime_to_millis(args.timestamp, TIMEZONE)
+            if ts is None:
+                print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} Invalid timestamp format. Use 'mm-dd-yyyy HH:MM:SS' or 'mm-dd-yyyy HH:MM:SS.sss'", file=sys.stderr)
+                sys.exit(1)
+
+        add_point(collection, pid, vector, text_content, ts)
+    else:
+        print(f"{colorize('Error:', COLOR_BOLD_BRICK_RED)} No action specified. Use -count, -list, -print, -fileprint, -fileadd, \n-consolidate, -delete, -stripdate, or -add.", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
