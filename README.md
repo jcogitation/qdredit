@@ -141,9 +141,13 @@ qdredit -fileadd
 
 ---
 
-## NOTES:
+## Final Notes:
 
 * Integer IDs are stored as numbers, UUIDs as strings.
 * The `-fileprint` output file is named 'qdrantpoints' in the current directory.
 * Use `--no-color` if redirecting output to a file or pipe.
 * The embedding server must be running for `-add` to work.
+
+## License
+
+This project is licensed under the GNU Affero General Public License v3.0 (AGPL-3.0). This means you are free to use, modify, and distribute this software, provided that any modified versions or network services utilizing this code are also made available under the same license. See the [LICENSE](LICENSE) file for full details.
